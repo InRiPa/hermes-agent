@@ -20,6 +20,12 @@ def _lock_twins(modifier: int) -> tuple[int, ...]:
     return _lock_variants(modifier)[1:]
 
 
+# Every printable ASCII codepoint except Space and lowercase a-z: the symbol/digit/uppercase
+# space the letter loop below does not cover. Consumed by the shift/alt/multi-modifier symbol
+# registrations — see the Shift+symbol rationale next to them.
+_NON_LETTER_PRINTABLE = tuple(cp for cp in range(33, 127) if not 97 <= cp <= 122)
+
+
 def _clear_vt100_prefix_cache() -> None:
     """Drop prompt_toolkit's memoized prefix-match answers after mutating ``ANSI_SEQUENCES``.
 
@@ -175,10 +181,17 @@ def install_modify_other_keys_aliases() -> int:
     ``_`` `` `` ``@``): same formats → the same ``Keys`` value the raw control byte maps to. *
     **Alt+letter** (a–z, A–Z): ``ESC[27;3;<codepoint>~`` and ``ESC[<codepoint>;3u`` → ``(Keys.Escape,
     <letter>)`` — matching how prompt_toolkit handles a bare ``ESC`` followed by a character. *
-    **Shift+letter** (a–z): → the uppercase character. * **Multi-modifier letters** (Shift+Alt=4,
-    Ctrl+Shift=6, Ctrl+Alt=7, Ctrl+Alt+Shift=8): normalized onto the same targets — Ctrl-bearing combos
-    behave as the Ctrl key (Alt adds an ``Escape`` prefix), matching how dte/kakoune normalize these
-    protocols. * **Lock-bit variants**: every CSI-u mapping above is also installed with the CapsLock (64)
+    **Shift+letter** (a–z): → the uppercase character. * **Shift+symbol** (every non-letter printable
+    producer ``!``-``/`` ``:``-``@`` ``[``-``'`` ``{``-``~``, by its SHIFTED codepoint): ``ESC[27;2;<cp>~``
+    → the character itself — modifyOtherKeys reports the produced character (Shift+-
+    arrives as 95 = ``_``), so these insert the character instead of leaking as literal ``[27;2;95~``;
+    digit codepoints under a shift modifier stay deliberately unmapped (a produced digit can never
+    legitimately carry shift, and a spec-deviant unshifted emitter would turn Shift+')' into a wrong '0').
+    * **Alt+symbol** (every non-letter printable ASCII including digits): → ``(Escape, <char>)``.
+    * **Multi-modifier letters+symbols** (Shift+Alt=4, Ctrl+Shift=6, Ctrl+Alt=7, Ctrl+Alt+Shift=8):
+    normalized onto the same targets as the letters — Ctrl-bearing combos behave as the Ctrl key (Alt adds
+    an ``Escape`` prefix), matching how dte/kakoune normalize these protocols.
+    * **Lock-bit variants**: every CSI-u mapping above is also installed with the CapsLock (64)
     and NumLock (128) bits ORed into the modifier parameter — kitty/ghostty include them while a lock is on,
     and without the variants every key combo dies with the lock enabled (``ESC[99;133u`` instead of
     ``ESC[99;5u``, #89651). * **Esc key**: ``ESC[27u`` / ``ESC[27;<mod>u`` (Kitty disambiguate mode reports
@@ -225,10 +238,23 @@ def _modify_other_keys_aliases(ANSI_SEQUENCES: dict, Keys) -> dict[str, object]:
     _install_paired(5, ctrl_key_map)
 
     # Letter combos. Alt+a -> (Escape, 'a') like bare Alt. Shift+a -> 'A' (safe on every Latin
-    # layout; Shift+digit symbols are layout-specific and deliberately NOT mapped — leaking beats
-    # wrong input). Kitty reports the UNSHIFTED codepoint, some modifyOtherKeys emitters the shifted
-    # one — map both. Ctrl-bearing combos normalize onto the Ctrl key (Alt adds an Escape prefix),
-    # Shift+Alt onto (Escape, UPPER) — the same normalization dte/kakoune apply.
+    # layout). Kitty reports the UNSHIFTED codepoint, some modifyOtherKeys emitters the shifted
+    # one — map both (targets agree, so the both-cases rule is trivially right for letters).
+    # Ctrl-bearing combos normalize onto the Ctrl key (Alt adds an Escape prefix), Shift+Alt
+    # onto (Escape, UPPER) — the same normalization dte/kakoune apply.
+    #
+    # Shift+SYMBOLS invert the old letters-only trade: it was "Shift+digit symbols are
+    # layout-specific, so NOT mapped — leaking beats wrong input". That held for kitty CSI-u,
+    # where the codepoint under a shift modifier is the UNSHIFTED key (a shifted '.'-key is
+    # ':' on one layout, '>' on another). Under modifyOtherKeys — the mode this CLI pushes
+    # Ghostty into — the codepoint IS the produced character (Shift+- arrived as
+    # ESC[27;2;95~ = '_', leaking as literal "[27;2;95~" text), so mapping the shifted
+    # codepoint is unambiguous and the leak becomes a bug. Only the shifted codepoint is
+    # mapped; kitty's unshifted symbol codepoints under a shift modifier stay unmapped (that
+    # ambiguity is real). A produced DIGIT can never legitimately carry a shift modifier
+    # (per spec, Shift+'0'-key arrives as the shifted ')'), so digit codepoints under a
+    # shift modifier stay unmapped too — mapping them could only ever fire on a spec-deviant
+    # emitter and would inject wrong input.
     for ch in letters:
         upper_char = chr(ch - 32)
         ctrl_key = ctrl_key_map.get(ch)
@@ -240,6 +266,25 @@ def _modify_other_keys_aliases(ANSI_SEQUENCES: dict, Keys) -> dict[str, object]:
                 _install_paired(6, {cp: ctrl_key})
                 for modifier in (7, 8):  # Ctrl+Alt and Ctrl+Alt+Shift — same normalization
                     _install_paired(modifier, {cp: (Keys.Escape, ctrl_key)})
+
+    # Non-letter printable ASCII — by the SHIFTED (produced) codepoint for shift-bearing
+    # modifiers, raw for Alt-alone. Modifier 2/4 symbol entries are installed in the mOK tilde
+    # form ONLY, bypassing _install_paired: _paired would also register the kitty CSI-u twin
+    # ``ESC[<cp>;2u``, but there the codepoint is the UNSHIFTED key (layout-ambiguous under
+    # shift — the produced char differs per layout), so kitty keeps the old "leak beats wrong
+    # input" call for its own encoding. Alt never shifts, so modifier 3 is unambiguous in both
+    # forms and uses _install_paired (digits included — Alt+digit carries no shift conflict).
+    # Ctrl-bearing twins (6/7/8) reuse ctrl_key_map: symbols normalize onto the same control
+    # byte (unambiguous, shift-insensitive); digits onto the existing Control0-9 rules.
+    for cp in _NON_LETTER_PRINTABLE:
+        if 48 <= cp <= 57:  # digit codepoints can't legitimately carry a shift modifier
+            continue
+        _put(f"\x1b[27;2;{cp}~", chr(cp))
+        _put(f"\x1b[27;4;{cp}~", (Keys.Escape, chr(cp)))
+    _install_paired(3, {cp: (Keys.Escape, chr(cp)) for cp in _NON_LETTER_PRINTABLE})
+    _install_paired(6, ctrl_key_map)
+    for modifier in (7, 8):
+        _install_paired(modifier, {cp: (Keys.Escape, key) for cp, key in ctrl_key_map.items()})
 
     # The Esc KEY under Kitty disambiguate mode: ESC[27u (+ modifiers 1-16 incl. super 9+, and
     # lock twins of the modifier-less form, which is how a lone Esc arrives with a lock on).

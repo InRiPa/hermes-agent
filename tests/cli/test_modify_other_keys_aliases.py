@@ -244,9 +244,83 @@ def test_install_is_idempotent():
 
 
 # ---------------------------------------------------------------------------
+# Shift+symbol (modifier 2/4, mOK form only): the produced character
+# ---------------------------------------------------------------------------
+# modifyOtherKeys reports the SHIFTED codepoint for symbol keys, so the codepoint IS the
+# produced character (Shift+- arrived as ESC[27;2;95~ = '_' and leaked as literal "[27;2;95~").
+
+
+@pytest.mark.parametrize("cp", [(c) for c in range(33, 127) if not (97 <= c <= 122) and not (48 <= c <= 57)])
+def test_modify_other_keys_shift_symbol_inserts_produced_char(cp):
+    seq = f"\x1b[27;2;{cp}~"
+    presses = _parse(seq)
+    assert presses == [chr(cp)], (
+        f"Shift+symbol {seq!r} must insert {chr(cp)!r} instead of leaking as literal text; got {presses!r}"
+    )
+
+
+@pytest.mark.parametrize("digit", "0123456789")
+def test_modify_other_keys_shift_digit_codepoints_stay_unmapped(digit):
+    """A digit codepoint can never legitimately carry a shift modifier (the spec's shift producer of the
+    0-key is ')'), so digit codepoints stay deliberately unmapped in BOTH encodings — leak beats
+    silently inserting a wrong digit for a spec-deviant emitter."""
+    for seq in (f"\x1b[27;2;{ord(digit)}~", f"\x1b[{ord(digit)};2u"):
+        presses = _parse(seq)
+        assert not (len(presses) == 1 and presses[0].key == digit), (
+            f"shift+digit codepoint {seq!r} must not silently insert '{digit}'"
+        )
+
+
+def test_kitty_shift_symbol_twins_stay_unmapped():
+    """For kitty CSI-u the shift codepoint is the UNSHIFTED key — layout-ambiguous under shift, so the
+    symbol twins stay unmapped (kitty keeps the historical 'leak beats wrong input' call). Only the
+    unambiguous modifyOtherKeys tilde form is mapped."""
+    assert _parse("\x1b[95;2u") != ["_"]  # 95 under shift is the '-' KEY, never its produced char
+    assert _parse("\x1b[64;2u") != ["@"]
+
+
+def test_legacy_tilde_shift_form_is_functional_not_symbolic():
+    """Legacy CSI-tilde forms encode FUNCTIONAL keys, not character codepoints: ESC[3;2~ is prompt_toolkit's
+    stock Shift+Delete mapping (Keys.ShiftDelete) — not a legacy encoding of any symbol producer."""
+    assert ANSI_SEQUENCES.get("\x1b[3;2~") == Keys.ShiftDelete
+
+
+@pytest.mark.parametrize("cp", [(c) for c in range(33, 127) if not (97 <= c <= 122)])
+def test_modify_other_keys_alt_symbol_maps_to_escape_char(cp):
+    """Alt never shifts, so for Alt the codepoint is unambiguous in both encodings — every non-letter
+    printable codepoint (digits included) → (Escape, char)."""
+    assert _parse(f"\x1b[27;3;{cp}~") == [Keys.Escape, chr(cp)]
+
+
+def test_ctrl_shift_symbol_normalizes_to_control_byte():
+    """Ctrl+Shift+symbol (modifier 6) behaves as the Ctrl key — Ctrl+Shift+'-' → ControlUnderscore."""
+    assert _parse("\x1b[27;6;64~") == [Keys.ControlAt]
+    assert _parse("\x1b[27;6;95~") == [Keys.ControlUnderscore]
+
+
+def test_shift_alt_symbol_maps_to_escape_char():
+    assert _parse("\x1b[27;4;95~") == [Keys.Escape, "_"]
+    assert _parse("\x1b[27;4;64~") == [Keys.Escape, "@"]
+
+
+def test_shift_symbol_data_field_is_clean_after_normalization():
+    """With the CLI's KeyPress-data normalizer active (cli.py installs it right after the alias install),
+    a mapped Shift+symbol must carry the clean character as its data — self-insert inserts event.data, so
+    the raw CSI would otherwise still leak even with the key correctly remapped."""
+    from hermes_cli.pt_input_extras import install_keypress_data_normalization
+
+    install_keypress_data_normalization()
+    out = []
+    parser = Vt100Parser(out.append)
+    for ch in "\x1b[27;2;95~":
+        parser.feed(ch)
+    parser.flush()
+    assert [(kp.key, kp.data) for kp in out] == [("_", "_")], "data must be the plain '_' char, not raw CSI"
+
+
+# ---------------------------------------------------------------------------
 # Shift+letter → uppercase
 # ---------------------------------------------------------------------------
-
 @pytest.mark.parametrize("letter", [chr(c) for c in range(ord('a'), ord('z') + 1)])
 def test_modify_other_keys_shift_letter_produces_uppercase(letter):
     """Shift+<letter> under modifyOtherKeys must produce the uppercase
